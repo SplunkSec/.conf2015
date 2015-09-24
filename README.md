@@ -13,7 +13,7 @@ The database file is called vfeed.db.  The Splunk DB Connect app expects SQLite 
 
 	ln -s vfeed.db vfeed.sqlitedb
 	
-Install the DB Connect 1 app in Splunk.  An example database config file is included in this repository.
+Install the DB Connect 1 app in Splunk.  Point Splunk at the path to the vfeed.sqlitedb file.  The config asks for a username, but it's irrelevant.
 
 I have noticed some occasional consistency problems in the data, such as having garbled CVE IDs and a few other things.  I have created a lookup table for virtually every table in vFeed and created a search to dump that table and sanitize the data.  Since vFeed is aggregating and normalizing data from the Internet, it has to work with what it has.  Sometimes the originating data source doesn't include the URL for things like vendor advisories and such.  I have done my best to add URLs to everything that I could.
 
@@ -21,7 +21,7 @@ The lookup tables are updated nightly.
 
 After downloading the Common Information Model app, look at the Vulnerabilities data model.  You will see that the top level search is driven off of a couple of tags.  I recommend modifying the search with something like:
 
-	tag=vulnerabilities tag=report | lookup nessus_cve_lookup nessus OUTPUT cve | dedup dest,protocol,dest_port,nessus,cve | mvexpand cve | lookup nvd_db_lookup cve OUTPUT cvss_base, cvss_impact, cvss_exploit, cvss_access_vector, cvss_authentication, cvss_access_vector, cvss_availability_impact, cvss_integrity_impact, cvss_confidentiality_impact
+	tag=vulnerabilities tag=report | lookup nessus_cve_lookup nessus OUTPUT cve | mvexpand cve | dedup dest,protocol,dest_port,nessus,cve | lookup nvd_db_lookup cve OUTPUT cvss_base, cvss_impact, cvss_exploit, cvss_access_vector, cvss_authentication, cvss_access_vector, cvss_availability_impact, cvss_integrity_impact, cvss_confidentiality_impact
 	
 There are also times when the Nessus plugins will have OSVDB or Bugtraq IDs that may be more recent than the data in vFeed.  You may wish for your data model/kvstore searches to also do a lookup on those two IDs and return the CVE ID as something like bugtraq_cve or osvdb_cve.  Then use eval to combine the cve, bugtraq_cve, and osvdb_cve fields, run mvexpand, and dedup the CVE IDs.
 
@@ -35,8 +35,10 @@ Create a search that will find all the switches you want to use for dynamic scan
 
 Configure the appropriate scanning policy and scan config for each subnet on each Nessus scanner.  You can use the following curl example to dump the list of scan policies on a scanner (you'll need to login first to get the token):
 
+	# get the token
 	curl -k -X POST -H 'Content-Type: application/json' -d '{"username":“nessus","password":“ne55us"}' https://10.10.10.10:8834/session 2>&1 | grep -Po '(?<=\"token\":\")[^\"]+'
 
+	# insert token from above after the "token=" part
 	curl -k -H 'X-Cookie: token=f99a30c7d590f07880f27aa913ee705955bcaa7b7d51e041' https://10.10.10.10:8834/scans
 
 In Nessus 5.x, scans are referenced by the UUID.  In Nessus 6.x, they use the "id" to interact with it in the API.
@@ -54,7 +56,7 @@ You also need to create a lookup table to hold the queue of IP addresses that ne
 
 Use a simple bash loop to iterate through the list of switches and dump the ARP cache (IPv4) or the address table for IPv6:
 
-	for switch in `cat ../lookups/switches.csv | sed “1d”`
+	for switch in `cat ../lookups/switches.csv | sed “1d”`;
 	do
 	  snmpwalk –c public –v 2c $switch ipNetToPhysicalPhysAddress 
 	done
@@ -63,7 +65,7 @@ You can either choose to write the output to a file and eat it with a file input
 
 Create a lookup table to contain the scan status history.  I used nessus_last_scan_lookup as the name.  I like to keep track of the IP address and the hostname if Nessus could resolve it as well as the MAC address.  
 
-Let's say you want to scan your hosts daily.  You need to find all of the IP/Mac addresses that Nessus currently knows about and give each a random time in the next 24 hours as the initial "last_scan" time.  Nessus can't figure out the MAC address of hosts on remote networks, so the search below looks for Nessus events that indicate a host is being scanned and the event for hostname resolution as well as the snmp_arp events and combines them with the transaction command.  This should give you a combined event with the IP and hostname (Nessus) and MAC address (snmp_arp).  Because of the output from snmpwalk, the MAC address needs to be tweaked with the sed functionality of rex to replace spaces with colons.
+Let's say you want to scan your hosts daily.  You need to find all of the IP/MAC addresses that you currently know about from your ARP data and give each a random time in the next 24 hours as the initial "last_scan" time.  The search below looks for Nessus events that indicate a host is being scanned or the event for hostname resolution as well as the snmp_arp events and combines them with the transaction command.  This should give you a combined event with the IP and hostname (Nessus) and IP/MAC address (snmp_arp).  Because of the output from snmpwalk, the MAC address needs to be tweaked with the sed functionality of rex to replace spaces with colons.
 
 	(sourcetype="nessus" AND signature="12053" OR signature="19506") OR sourcetype=snmp_arp | rex field=_raw "(?i)resolves as (?P<hostname>[^$]+)(?=\.)" | rex mode=sed field=dest_mac "s/\s/:/g"| transaction maxspan=1h dest | eval padding=random()/2147483648*86400 | eval last_scan=now()+padding | table last_scan,hostname,dest,dest_mac | outputlookup nessus_last_scan_lookup
 	
@@ -73,14 +75,15 @@ Now you want to take your snmp_arp events, look up the MAC address in the nessus
 
 Write a script that will iterate through each line in the scan queue and extract the list of IPs, the scanner IP, and scan ID into variables and use them to launch the scan from the command line:
 
-	for scan in `cat /opt/splunk/etc/apps/vFeed/lookups/nessus_scan_queue_lookup.csv | sed '1d'`; do
-		targets = `echo $scan | grep -Po '^\"[^\"]+\"'`
-		scanner = `echo $scan | grep -Po '(?<=\",\")\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}'`
-		scan_id = `echo $scan | grep -Po '(?<=\",)\d+$'`
-		
-		token = `curl -k -X POST -H 'Content-Type: application/json' -d '{"username":“nessus","password":“ne55us"}' https://$scanner/session 2>&1 | grep -Po '(?<=\"token\":\")[^\"]+'`
-		
-		curl -k -X POST -H 'X-Cookie: token=$token' -H 'Content-Type: application/json' -d '{"alt_targets": [$targets]}' https://$scanner:8834/scans/$scan_id/launch
+	for scan in `cat /opt/splunk/etc/apps/vFeed/lookups/nessus_scan_queue_lookup.csv | sed '1d'`; 
+		do
+			targets = `echo $scan | grep -Po '^\"[^\"]+\"'`
+			scanner = `echo $scan | grep -Po '(?<=\",\")\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}'`
+			scan_id = `echo $scan | grep -Po '(?<=\",)\d+$'`
+			
+			token = `curl -k -X POST -H 'Content-Type: application/json' -d '{"username":“nessus","password":“ne55us"}' https://$scanner/session 2>&1 | grep -Po '(?<=\"token\":\")[^\"]+'`
+			
+			curl -k -X POST -H 'X-Cookie: token=$token' -H 'Content-Type: application/json' -d '{"alt_targets": [$targets]}' https://$scanner:8834/scans/$scan_id/launch
 		
 		done
 		
@@ -101,7 +104,7 @@ Create a lookup table to hold the status of scans.  I used nessus_scan_status_lo
 
 Create a file input that will monitor the "files" directory of the Nessus user you use to launch the scan.  This will be located in /opt/nessus/var/nessus/users/$username$/files.  Have it index anything with a CSV extension.  
 
-Create a script that will iterate through the nessus_scan_status_lookup table, connect to the Nessus scanner, and export the scan to CSV format.  The basic examples above can serve as a guide.  The API command is:
+Create a script that will iterate through the nessus_scan_status_lookup table, connect to the Nessus scanner, and export the scan to CSV format.  The basic examples above can serve as a guide.  AN example of the API command is:
 
 	curl -k -X POST -H 'X-Cookie: token=f8f0b0821d0ef193d346a2951dbc9e28314bcf232d40e4e7' -H 'Content-Type: application/json' -d '{"format": "csv"} ' https://10.10.10.10:8834/scans/6/export
 
